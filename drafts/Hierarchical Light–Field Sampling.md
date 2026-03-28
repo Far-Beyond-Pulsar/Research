@@ -63,7 +63,7 @@ The field performs a rapid "Mip-Map" style propagation, where energy from dense 
 By using the Clip-Stack approach, memory remains constant. A typical configuration (4 levels of $128^3$ half-precision RGBA voxels) consumes approximately **128MB to 256MB** of VRAM. This is a "sane" and predictable overhead for AAA titles targeting consoles.
 
 ### 5.3 Frame-Time Stability
-In testing across scenes ranging from 100 to 100,000 dynamic lights, HLFS demonstrated a **flat performance curve**. While traditional engines saw frame-time spikes in dense "Marketplace" or "City" scenes, HLFS maintained a consistent shading cost. The only variable was the variance (noise) in the image, which was successfully mitigated by the feedback loop and temporal accumulation.
+In scenes ranging from 100 to 100,000 dynamic lights, HLFS provides a **flat performance curve**. While traditional engines saw frame-time spikes in dense "Marketplace" or "City" scenes, HLFS aims to maintain a consistent shading cost. The only variable is the variance (noise) in the image, which was successfully mitigated by the feedback loop and temporal accumulation.
 
 ### 5.4 Toroidal Movement Cost
 The cost of updating the Clip-Stack during camera movement is negligible. Because only the "leading edge" of the frustum needs new injection data, the per-frame update cost remains under **0.5ms** on modern hardware.
