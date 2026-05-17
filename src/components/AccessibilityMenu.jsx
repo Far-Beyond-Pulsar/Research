@@ -288,19 +288,27 @@ export default function AccessibilityMenu() {
 
         if (abortRef.current) break;
 
+        mlog('wav received for', sec.label, 'buffer:', wav?.buffer?.byteLength, 'sampleRate:', wav?.sampleRate);
+
         // Add to debug list as a playable blob
-        const blob = new Blob([wav.buffer], { type: 'audio/wav' });
-        const url  = URL.createObjectURL(blob);
-        setDebugWavs(prev => [...prev, { label: sec.label, url }]);
+        try {
+          const blob = new Blob([wav.buffer], { type: 'audio/wav' });
+          const url  = URL.createObjectURL(blob);
+          mlog('blob created, size:', blob.size, 'url:', url);
+          setDebugWavs(prev => [...prev, { label: sec.label, url }]);
+        } catch (e) {
+          mlog('blob creation failed:', e.message);
+        }
 
         // Decode WAV → AudioBuffer
         let decoded;
         try {
-          // slice() so decodeAudioData doesn't detach the original transferred buffer
+          mlog('decoding audio data, byteLength:', wav.buffer.byteLength);
           decoded = await ctx.decodeAudioData(wav.buffer.slice(0));
+          mlog('decoded OK, duration:', decoded.duration, 'channels:', decoded.numberOfChannels);
         } catch (e) {
           console.error('decodeAudioData failed:', e);
-          setTtsMsg(`Audio decode error for "${sec.label}"`);
+          setTtsMsg(`Audio decode error for "${sec.label}": ${e.message}`);
           continue;
         }
 
