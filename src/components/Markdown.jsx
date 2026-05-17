@@ -1,0 +1,944 @@
+'use client';
+
+import React, { useState, useEffect, useCallback } from 'react';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
+import remarkMath from 'remark-math';
+import remarkGithubBlockquoteAlert from 'remark-github-blockquote-alert';
+import rehypeKatex from 'rehype-katex';
+import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
+import { github as githubDark } from 'react-syntax-highlighter/dist/cjs/styles/hljs';
+import rehypeRaw from 'rehype-raw';
+import rehypeSanitize from 'rehype-sanitize';
+import 'katex/dist/katex.min.css';
+import { defaultSchema } from 'hast-util-sanitize';
+import slugify from 'slugify';
+import ZoomableMermaid from './ZoomableMermaid';
+import CodeBlock from './CodeBlock';
+import DirTree from './DirTree';
+
+// Global queue for sequential mermaid rendering
+let renderQueue = [];
+let isRendering = false;
+
+async function processRenderQueue() {
+  if (isRendering || renderQueue.length === 0) return;
+  
+  isRendering = true;
+  const { id, callback } = renderQueue.shift();
+  
+  console.log('Processing diagram from queue:', id);
+  await callback();
+  
+  isRendering = false;
+  
+  // Process next in queue
+  if (renderQueue.length > 0) {
+    setTimeout(processRenderQueue, 50);
+  }
+}
+
+export function queueMermaidRender(id, callback) {
+  renderQueue.push({ id, callback });
+  processRenderQueue();
+}
+
+const customSchema = {
+  ...defaultSchema,
+  attributes: {
+    ...defaultSchema.attributes,
+    div: [
+      ...(defaultSchema.attributes?.div || []),
+      'className',
+      'dir',
+    ],
+    blockquote: [
+      ...(defaultSchema.attributes?.blockquote || []),
+      'className',
+      'dir',
+    ],
+    p: [
+      ...(defaultSchema.attributes?.p || []),
+      'className',
+      'dir',
+    ],
+    svg: [
+      'className',
+      'viewBox',
+      'width',
+      'height',
+      'ariaHidden',
+      ['aria-hidden', 'true'],
+    ],
+    path: ['d'],
+    h1: [...(defaultSchema.attributes?.h1 || []), 'id'],
+    h2: [...(defaultSchema.attributes?.h2 || []), 'id'],
+    h3: [...(defaultSchema.attributes?.h3 || []), 'id'],
+    h4: [...(defaultSchema.attributes?.h4 || []), 'id'],
+    h5: [...(defaultSchema.attributes?.h5 || []), 'id'],
+    h6: [...(defaultSchema.attributes?.h6 || []), 'id'],
+  },
+  tagNames: [
+    ...(defaultSchema.tagNames || []),
+    'svg',
+    'path',
+  ],
+};
+
+// Generate slug from heading text - same algorithm as extract-headings.js
+function generateSlug(text) {
+  return slugify(String(text), {
+    lower: true,
+    strict: true,
+    remove: /[*+~.()'"!:@]/g
+  });
+}
+
+// KaTeX display-math zoom wrapper component
+function KaTeXZoomWrapper({ children, className, ...props }) {
+  const [expanded, setExpanded] = React.useState(false);
+  return (
+    <span
+      className={`katex-zoom-wrapper${expanded ? ' katex-zoom-expanded' : ''} ${className || ''}`}
+      {...props}
+    >
+      {children}
+      <button
+        className="katex-zoom-btn"
+        aria-label={expanded ? 'Collapse math' : 'Expand math'}
+        onClick={() => setExpanded(e => !e)}
+      >
+        {expanded ? (
+          <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/>
+            <line x1="10" y1="14" x2="3" y2="21"/><line x1="21" y1="3" x2="14" y2="10"/>
+          </svg>
+        ) : (
+          <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/>
+            <line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/>
+          </svg>
+        )}
+      </button>
+    </span>
+  );
+}
+
+// Extract text from React children (handles nested elements)
+function extractTextFromChildren(children) {
+  if (typeof children === 'string') {
+    return children;
+  }
+  if (Array.isArray(children)) {
+    return children.map(extractTextFromChildren).join('');
+  }
+  if (children && typeof children === 'object' && children.props) {
+    return extractTextFromChildren(children.props.children);
+  }
+  return String(children || '');
+}
+
+export default function MarkdownRenderer({ 
+  content
+}) {
+  const [copied, setCopied] = useState({});
+  const [isMounted, setIsMounted] = useState(false);
+  const contentRef = React.useRef(null);
+  
+  // Set isMounted to true when component is mounted on client
+  useEffect(() => {
+    setIsMounted(true);
+  }, []);
+  
+  // Handle copying code to clipboard
+  const handleCopyCode = useCallback((code, id) => {
+    if (typeof navigator !== 'undefined') {
+      navigator.clipboard.writeText(code).then(() => {
+        // Use a more targeted state update to avoid re-rendering Mermaid diagrams
+        setCopied(prev => {
+          const newState = { ...prev };
+          newState[id] = true;
+          return newState;
+        });
+        
+        setTimeout(() => {
+          // Use a more targeted state update to avoid re-rendering Mermaid diagrams
+          setCopied(prev => {
+            const newState = { ...prev };
+            newState[id] = false;
+            return newState;
+          });
+        }, 2000);
+      });
+    }
+  }, []);
+
+  // Wrap display math blocks with a zoom button after render.
+  // We target .katex-display first, falling back to any .katex whose parent
+  // is a block-level element (i.e. display math without the outer wrapper).
+  useEffect(() => {
+    if (!isMounted) return;
+    const timer = setTimeout(() => {
+      const root = contentRef.current;
+      if (!root) return;
+
+      // Collect display-math candidates: .katex-display, or top-level .katex not inside .katex-display
+      const candidates = [
+        ...root.querySelectorAll('.katex-display:not([data-zoom-wrapped])'),
+        ...Array.from(root.querySelectorAll('.katex:not([data-zoom-wrapped])')).filter(
+          el => !el.closest('.katex-display')
+        ),
+      ];
+
+      candidates.forEach(el => {
+        el.setAttribute('data-zoom-wrapped', 'true');
+
+        // Outer wrapper — position:relative, no overflow, button lives here
+        const wrapper = document.createElement('span');
+        wrapper.className = 'katex-zoom-wrapper';
+        el.parentNode.insertBefore(wrapper, el);
+
+        // Inner scroller — overflow-x:auto lives here so button doesn't scroll away
+        const scroller = document.createElement('span');
+        scroller.className = 'katex-zoom-scroller';
+        wrapper.appendChild(scroller);
+        scroller.appendChild(el);
+
+        const btn = document.createElement('button');
+        btn.className = 'katex-zoom-btn';
+        btn.setAttribute('aria-label', 'Expand math');
+        const expandIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg>`;
+        const collapseIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><line x1="10" y1="14" x2="3" y2="21"/><line x1="21" y1="3" x2="14" y2="10"/></svg>`;
+        btn.innerHTML = expandIcon;
+        btn.onclick = () => {
+          const expanded = wrapper.classList.toggle('katex-zoom-expanded');
+          btn.setAttribute('aria-label', expanded ? 'Collapse math' : 'Expand math');
+          btn.innerHTML = expanded ? collapseIcon : expandIcon;
+        };
+        wrapper.appendChild(btn);
+      });
+    }, 600);
+    return () => clearTimeout(timer);
+  }, [isMounted, content]);
+
+  // Initialize mermaid once globally when component mounts
+  useEffect(() => {
+    if (!isMounted) return;
+
+    import('mermaid').then(({ default: mermaid }) => {
+      // Initialize once with proper config
+      mermaid.initialize({
+        startOnLoad: false,
+        theme: 'dark',
+        securityLevel: 'loose',
+        deterministicIds: true,
+        deterministicIDSeed: 'pulsar-docs',
+      });
+      console.log('Mermaid initialized globally');
+    });
+  }, [isMounted]);
+
+
+
+  if (!content) return null;
+
+  // Use GitHub Dark theme for code blocks
+  const codeStyle = {
+    ...githubDark,
+    'pre[class*="language-"]': {
+      ...githubDark['pre[class*="language-"]'],
+      margin: 0,
+    },
+  };
+
+  // Only render ReactMarkdown on the client side
+  return (
+    <div ref={contentRef} className="markdown-content dark-theme">
+      {isMounted ? (
+        <ReactMarkdown
+          remarkPlugins={[
+            remarkGfm,
+            [remarkMath, { singleDollarTextMath: false }],
+            remarkGithubBlockquoteAlert,
+          ]}
+          rehypePlugins={[
+            rehypeRaw,
+            [rehypeSanitize, customSchema],
+            rehypeKatex,
+          ]}
+          components={{
+            // Handle headings with proper IDs for scroll anchors
+            h1({ node, children, ...props }) {
+              const text = extractTextFromChildren(children);
+              const id = generateSlug(text);
+              return <h1 id={id} {...props}>{children}</h1>;
+            },
+            h2({ node, children, ...props }) {
+              const text = extractTextFromChildren(children);
+              const id = generateSlug(text);
+              return <h2 id={id} {...props}>{children}</h2>;
+            },
+            h3({ node, children, ...props }) {
+              const text = extractTextFromChildren(children);
+              const id = generateSlug(text);
+              return <h3 id={id} {...props}>{children}</h3>;
+            },
+            h4({ node, children, ...props }) {
+              const text = extractTextFromChildren(children);
+              const id = generateSlug(text);
+              return <h4 id={id} {...props}>{children}</h4>;
+            },
+            h5({ node, children, ...props }) {
+              const text = extractTextFromChildren(children);
+              const id = generateSlug(text);
+              return <h5 id={id} {...props}>{children}</h5>;
+            },
+            h6({ node, children, ...props }) {
+              const text = extractTextFromChildren(children);
+              const id = generateSlug(text);
+              return <h6 id={id} {...props}>{children}</h6>;
+            },
+            // Handle code blocks with syntax highlighting and Mermaid diagrams
+            code({ node, className, children, ...props }) {
+              const match = /language-(\w+)/.exec(className || '');
+              const language = match ? match[1] : null;
+              const raw = String(children);
+              // Block code: has a language class OR ends with a newline (fenced block without lang)
+              const isBlock = !!match || raw.endsWith('\n');
+              const codeContent = raw.replace(/\n$/, '');
+
+              if (isBlock) {
+                if (language === 'mermaid') {
+                  const contentKey = codeContent.split('').reduce((a, b) => {
+                    a = ((a << 5) - a) + b.charCodeAt(0);
+                    return a & a;
+                  }, 0);
+                  const uniqueKey = `mermaid-${contentKey}-${Math.random().toString(36).substr(2, 5)}`;
+                  return <ZoomableMermaid key={uniqueKey} diagramKey={uniqueKey} content={codeContent} />;
+                }
+
+                if (language === 'dirtree') {
+                  return <DirTree content={codeContent} />;
+                }
+
+                return (
+                  <CodeBlock
+                    language={language || 'text'}
+                    code={codeContent}
+                    showLineNumbers={language !== 'markdown'}
+                  />
+                );
+              }
+
+              // Inline code
+              return (
+                <code className={`${className || ''} inline-code`} {...props}>
+                  {children}
+                </code>
+              );
+            },
+          }}
+        >
+          {content}
+        </ReactMarkdown>
+      ) : (
+        <div className="space-y-6">
+          {/* Loading skeleton for markdown content */}
+          <div className="space-y-4">
+            {/* Title skeleton */}
+            <div className="h-8 bg-gray-800 rounded w-3/4 animate-pulse"></div>
+            
+            {/* Paragraph skeletons */}
+            <div className="space-y-2">
+              <div className="h-4 bg-gray-800 rounded w-full animate-pulse"></div>
+              <div className="h-4 bg-gray-800 rounded w-full animate-pulse"></div>
+              <div className="h-4 bg-gray-800 rounded w-2/3 animate-pulse"></div>
+            </div>
+            
+            {/* Heading skeleton */}
+            <div className="h-6 bg-gray-800 rounded w-1/2 animate-pulse mt-8"></div>
+            
+            {/* More paragraphs */}
+            <div className="space-y-2">
+              <div className="h-4 bg-gray-800 rounded w-full animate-pulse"></div>
+              <div className="h-4 bg-gray-800 rounded w-5/6 animate-pulse"></div>
+            </div>
+            
+            {/* Code block skeleton */}
+            <div className="h-32 bg-gray-800 rounded animate-pulse mt-4"></div>
+            
+            {/* More content */}
+            <div className="space-y-2 mt-8">
+              <div className="h-4 bg-gray-800 rounded w-full animate-pulse"></div>
+              <div className="h-4 bg-gray-800 rounded w-4/5 animate-pulse"></div>
+            </div>
+          </div>
+        </div>
+      )}
+      
+      <style jsx global>{`
+        @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap');
+        /* Math styling */
+        .katex {
+          font-size: 1.1em !important;
+          font-family: 'KaTeX_Main', serif;
+        }
+        
+        .katex-display {
+          overflow-x: auto;
+          overflow-y: hidden;
+          padding: 1em 0;
+          margin: 1.2em 0 !important;
+        }
+
+        /* Zoomable KaTeX wrapper */
+        .katex-zoom-wrapper {
+          position: relative;
+          display: block;
+        }
+
+        /* Inner scroll container — no overflow by default, only when expanded */
+        .katex-zoom-scroller {
+          display: block;
+          overflow: hidden;
+        }
+
+        .katex-zoom-btn {
+          position: absolute;
+          top: 0.5em;
+          right: 0.5em;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          width: 28px;
+          height: 28px;
+          background: rgba(21, 26, 34, 0.95);
+          border: 1px solid #30363d;
+          border-radius: 6px;
+          color: #8b949e;
+          cursor: pointer;
+          backdrop-filter: blur(4px);
+          z-index: 10;
+          transition: color 0.15s ease, background 0.15s ease, border-color 0.15s ease;
+        }
+
+        .katex-zoom-btn:hover {
+          color: #c9b0ff;
+          background: rgba(124, 58, 237, 0.2);
+          border-color: #7c3aed;
+        }
+
+        /* Expanded state — styled on wrapper, scrolls on inner scroller */
+        .katex-zoom-expanded {
+          width: 100%;
+          background: rgba(13, 17, 23, 0.7);
+          border: 1px solid #30363d;
+          border-radius: 10px;
+          /* only top padding so the button doesn't overlap the math */
+          padding-top: 2.5em;
+          box-shadow: 0 4px 16px rgba(0,0,0,0.3);
+          margin: 1em 0;
+        }
+
+        .katex-zoom-expanded .katex-zoom-scroller {
+          overflow-x: auto;
+          padding: 0.8em 1em 1em 1em;
+        }
+
+        /* zoom reflows layout unlike transform:scale so nothing gets clipped */
+        .katex-zoom-expanded .katex,
+        .katex-zoom-expanded .katex-display {
+          zoom: 1.6;
+          display: block;
+        }
+        
+        .dark-theme .katex {
+          color: #e4e4e7;
+        }
+        
+        /* Custom dark theme for code blocks */
+        .code-block-container {
+          margin: 2em 0;
+          border-radius: 8px;
+          overflow: auto;
+          border: 1px solid #23272e;
+          background: #181a20;
+          box-shadow: 0 2px 8px 0 rgba(0,0,0,0.08);
+          font-size: 0.9em;
+          position: relative;
+        }
+        .code-block-container,
+        .code-block-container pre,
+        .code-block-container code,
+        .code-block-container div,
+        .code-block-container .code-header {
+          background: rgb(13, 17, 23) !important;
+        }
+        .code-block-container {
+          margin: 2em 0;
+          border-radius: 8px;
+          overflow: hidden;
+          border: 1px solid #30363d;
+          background: rgb(13, 17, 23);
+          box-shadow: 0 2px 8px 0 rgba(0,0,0,0.08);
+          font-size: 0.9em;
+        }
+        .code-header {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          padding: 0.5em 1em;
+          background: #161b22;
+          border-bottom: 1px solid #30363d;
+        }
+        .language-badge {
+          font-size: 0.8em;
+          color: #8b949e;
+        }
+        .copy-button {
+          font-size: 0.8em;
+          padding: 0.25em 0.5em;
+          background: #21262d;
+          border: 1px solid #30363d;
+          border-radius: 4px;
+          color: #c9d1d9;
+          cursor: pointer;
+        }
+        .copy-button:hover {
+          background: #30363d;
+        }
+        .code-content {
+          display: flex;
+          font-family: 'JetBrains Mono', monospace;
+          font-size: 0.9em;
+          line-height: 1.2;
+        }
+        .line-numbers {
+          background: #161b22;
+          color: #6e7681;
+          padding: 0.8em;
+          text-align: right;
+          user-select: none;
+          flex-shrink: 0;
+        }
+        .line-number {
+          height: 1.2em;
+        }
+        .code-separator {
+          width: 1px;
+          background: #30363d;
+          flex-shrink: 0;
+        }
+        .code-lines {
+          flex: 1;
+          overflow: auto;
+        }
+        .code-lines pre {
+          margin: 0;
+          padding: 0.8em;
+          background: rgb(13, 17, 23);
+          color: #c9d1d9;
+          font-family: inherit;
+          font-size: inherit;
+          line-height: inherit;
+        }
+        .code-lines code {
+          background: transparent;
+          padding: 0;
+          font-family: inherit;
+        }
+        .code-line {
+          height: 1.2em;
+        }
+          color: #d4d4d4 !important;
+        }
+        .code-block-container .token.property,
+        .code-block-container .token.tag,
+        .code-block-container .token.constant,
+        .code-block-container .token.symbol {
+          color: #569cd6 !important;
+        }
+        .code-block-container .token.selector,
+        .code-block-container .token.attr-name,
+        .code-block-container .token.string,
+        .code-block-container .token.char,
+        .code-block-container .token.builtin,
+        .code-block-container .token.inserted {
+          color: #ce9178 !important;
+        }
+        .code-block-container .token.operator,
+        .code-block-container .token.entity,
+        .code-block-container .token.url,
+        .code-block-container .token.variable {
+          color: #dcdcaa !important;
+        }
+        .code-block-container .token.atrule,
+        .code-block-container .token.attr-value,
+        .code-block-container .token.keyword {
+          color: #c586c0 !important;
+        }
+        .code-block-container .token.function,
+        .code-block-container .token.class-name {
+          color: #d7ba7d !important;
+        }
+        .code-block-container .token.regex,
+        .code-block-container .token.important {
+          color: #d16969 !important;
+        }
+        .code-block-container .token.deleted {
+          color: #d16969 !important;
+        }
+        .code-block-container::-webkit-scrollbar {
+          height: 10px;
+          background: #23272e;
+        }
+        .code-block-container::-webkit-scrollbar-thumb {
+          background: #444;
+          border-radius: 6px;
+        }
+        .code-block-container pre,
+        .code-block-container code {
+          font-family: 'JetBrains Mono', Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace !important;
+          margin: 0 !important;
+          padding: 0 !important;
+          box-sizing: border-box;
+          background: #0d1117 !important;
+          color: #c9d1d9 !important;
+          font-size: 0.92em !important;
+          line-height: 1 !important;
+          min-height: 0 !important;
+        }
+        .code-block-container pre {
+          padding: 0.5em 0.7em !important;
+          margin: 0 !important;
+          border-radius: 0.7em !important;
+          background: transparent !important;
+          box-shadow: none !important;
+        }
+        /* Highlighted lines (Monaco style) */
+        .code-block-container .react-syntax-highlighter-line-highlighted {
+          background: rgba(0, 122, 204, 0.18) !important;
+          border-radius: 0.35em !important;
+          margin: 0 !important;
+          padding: 0 !important;
+          box-shadow: 0 1px 4px 0 rgba(0,0,0,0.04);
+          line-height: 1 !important;
+          min-height: 0 !important;
+        }
+        /* Monaco-style line numbers */
+        .code-block-container .react-syntax-highlighter-line-number {
+          color: #8b949e;
+          opacity: 0.8;
+          font-size: 0.88em !important;
+          padding-right: 0.8em !important;
+          margin-right: 0.8em !important;
+          line-height: 1 !important;
+          min-height: 0 !important;
+          border-right: none !important;
+        }
+        /* Monaco-style selection */
+        .code-block-container ::selection {
+          background: rgba(0,122,204,0.25);
+        }
+        
+        .code-header {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          padding: 0.5em 1em;
+          background-color: #343434;
+          border-bottom: 1px solid #444;
+        }
+        
+        .language-badge {
+          font-size: 0.8em;
+          color: #bbb;
+        }
+        
+        .copy-button {
+          font-size: 0.8em;
+          padding: 0.25em 0.5em;
+          background-color: #555;
+          border: none;
+          border-radius: 0.25em;
+          color: #eee;
+          cursor: pointer;
+        }
+        
+        .copy-button:hover {
+          background-color: #666;
+        }
+        
+        /* Inline code */
+        .inline-code {
+          background-color: #2d2d2d;
+          border-radius: 0.25em;
+          padding: 0.2em 0.4em;
+          font-family: 'JetBrains Mono', Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+        }
+        
+        /* Mermaid styling */
+        .mermaid-diagram-container {
+          margin: 1.5em 0;
+          text-align: center;
+          background-color: rgba(255, 255, 255, 0.05);
+          padding: 1em;
+          border-radius: 0.5em;
+        }
+        
+        /* Custom containers */
+        .custom-block {
+          margin: 1.5em 0;
+          padding: 1em;
+          border-left: 4px solid;
+          border-radius: 0.25em;
+        }
+        
+        .custom-block-title {
+          font-weight: bold;
+          margin-bottom: 0.5em;
+        }
+        
+        .custom-block.custom-block-info { 
+          border-color: #3498db; 
+          background-color: rgba(52, 152, 219, 0.2); 
+        }
+        .custom-block.custom-block-warning { 
+          border-color: #f39c12; 
+          background-color: rgba(243, 156, 18, 0.2); 
+        }
+        .custom-block.custom-block-danger { 
+          border-color: #e74c3c; 
+          background-color: rgba(231, 76, 60, 0.2); 
+        }
+        .custom-block.custom-block-tip { 
+          border-color: #2ecc71; 
+          background-color: rgba(46, 204, 113, 0.2); 
+        }
+        .custom-block.custom-block-success { 
+          border-color: #2ecc71; 
+          background-color: rgba(46, 204, 113, 0.2); 
+        }
+        /* ── Prose typography (font-size owned by globals.css for a11y scale) ── */
+        .markdown-content {
+          font-family: var(--font-prose), system-ui, -apple-system, 'Segoe UI', sans-serif;
+          line-height: 1.8;
+          color: #e6edf3;
+        }
+
+        .markdown-content p {
+          margin-top: 1.25rem;
+          margin-bottom: 1.25rem;
+        }
+
+        .markdown-content h1,
+        .markdown-content h2,
+        .markdown-content h3,
+        .markdown-content h4,
+        .markdown-content h5,
+        .markdown-content h6 {
+          font-family: var(--font-prose), system-ui, -apple-system, 'Segoe UI', sans-serif;
+          font-weight: 700;
+          line-height: 1.3;
+          color: #e6edf3;
+        }
+
+        .markdown-content h1 { font-size: 1.9rem; margin: 2.5rem 0 1rem; border-bottom: 1px solid #30363d; padding-bottom: 0.4em; }
+        .markdown-content h2 { font-size: 1.45rem; margin: 2.2rem 0 0.8rem; border-bottom: 1px solid #21262d; padding-bottom: 0.3em; }
+        .markdown-content h3 { font-size: 1.18rem; margin: 1.8rem 0 0.6rem; }
+        .markdown-content h4 { font-size: 1.05rem; margin: 1.5rem 0 0.5rem; }
+        .markdown-content h5, .markdown-content h6 { font-size: 0.95rem; margin: 1.2rem 0 0.4rem; color: #8b949e; }
+
+        .markdown-content a {
+          color: #58a6ff;
+          text-decoration: underline;
+          text-decoration-color: rgba(88, 166, 255, 0.35);
+          text-underline-offset: 2px;
+          transition: text-decoration-color 0.15s;
+        }
+        .markdown-content a:hover {
+          text-decoration-color: #58a6ff;
+        }
+
+        .markdown-content ul,
+        .markdown-content ol {
+          padding-left: 1.6em;
+          margin: 1rem 0;
+        }
+        .markdown-content li {
+          margin: 0.35rem 0;
+        }
+        .markdown-content li > ul,
+        .markdown-content li > ol {
+          margin: 0.25rem 0;
+        }
+
+        .markdown-content blockquote {
+          margin: 1.5rem 0;
+          padding: 0.75em 1em;
+          border-left: 3px solid #388bfd;
+          background: rgba(56, 139, 253, 0.07);
+          border-radius: 0 6px 6px 0;
+          color: #8b949e;
+        }
+        .markdown-content blockquote > p {
+          margin: 0;
+        }
+
+        .markdown-content hr {
+          border: none;
+          border-top: 1px solid #30363d;
+          margin: 2rem 0;
+        }
+
+        /* ── Tables ── */
+        .markdown-content table {
+          width: 100%;
+          border-collapse: collapse;
+          font-size: 0.92em;
+          margin: 1.75rem 0;
+          border-radius: 8px;
+          overflow: hidden;
+          border: 1px solid #30363d;
+        }
+
+        .markdown-content thead {
+          background: #161b22;
+        }
+
+        .markdown-content thead th {
+          padding: 10px 14px;
+          text-align: left;
+          font-weight: 600;
+          font-size: 0.85em;
+          color: #8b949e;
+          text-transform: uppercase;
+          letter-spacing: 0.05em;
+          border-bottom: 1px solid #30363d;
+          white-space: nowrap;
+        }
+
+        .markdown-content tbody tr {
+          border-bottom: 1px solid #21262d;
+          transition: background 0.1s;
+        }
+
+        .markdown-content tbody tr:last-child {
+          border-bottom: none;
+        }
+
+        .markdown-content tbody tr:nth-child(even) {
+          background: rgba(22, 27, 34, 0.6);
+        }
+
+        .markdown-content tbody tr:hover {
+          background: rgba(56, 139, 253, 0.06);
+        }
+
+        .markdown-content td {
+          padding: 9px 14px;
+          vertical-align: top;
+          color: #c9d1d9;
+        }
+
+        .markdown-content td code,
+        .markdown-content th code {
+          background: #2d333b;
+          border-radius: 4px;
+          padding: 1px 5px;
+          font-size: 0.88em;
+          font-family: 'JetBrains Mono', monospace;
+        }
+
+        /* GitHub Alert/Callout Styles */
+        .markdown-alert {
+          padding: 1rem 1rem 1rem 1.5rem;
+          margin: 1.5rem 0;
+          border-left: 4px solid;
+          border-radius: 0.375rem;
+        }
+
+        .markdown-alert > :first-child {
+          margin-top: 0;
+        }
+
+        .markdown-alert > :last-child {
+          margin-bottom: 0;
+        }
+
+        .markdown-alert-title {
+          display: flex;
+          align-items: center;
+          font-weight: 600;
+          margin-bottom: 0.5rem;
+          font-size: 0.95rem;
+        }
+
+        .markdown-alert-title svg {
+          margin-right: 0.5rem;
+          flex-shrink: 0;
+        }
+
+        /* NOTE (blue) */
+        .markdown-alert.markdown-alert-note {
+          border-color: #3b82f6;
+          background-color: rgba(59, 130, 246, 0.1);
+        }
+        .markdown-alert.markdown-alert-note .markdown-alert-title {
+          color: #3b82f6;
+        }
+        .markdown-alert.markdown-alert-note svg {
+          fill: #3b82f6;
+        }
+
+        /* TIP (green) */
+        .markdown-alert.markdown-alert-tip {
+          border-color: #10b981;
+          background-color: rgba(16, 185, 129, 0.1);
+        }
+        .markdown-alert.markdown-alert-tip .markdown-alert-title {
+          color: #10b981;
+        }
+        .markdown-alert.markdown-alert-tip svg {
+          fill: #10b981;
+        }
+
+        /* IMPORTANT (purple) */
+        .markdown-alert.markdown-alert-important {
+          border-color: #a855f7;
+          background-color: rgba(168, 85, 247, 0.1);
+        }
+        .markdown-alert.markdown-alert-important .markdown-alert-title {
+          color: #a855f7;
+        }
+        .markdown-alert.markdown-alert-important svg {
+          fill: #a855f7;
+        }
+
+        /* WARNING (yellow/orange) */
+        .markdown-alert.markdown-alert-warning {
+          border-color: #f59e0b;
+          background-color: rgba(245, 158, 11, 0.1);
+        }
+        .markdown-alert.markdown-alert-warning .markdown-alert-title {
+          color: #f59e0b;
+        }
+        .markdown-alert.markdown-alert-warning svg {
+          fill: #f59e0b;
+        }
+
+        /* CAUTION (red) */
+        .markdown-alert.markdown-alert-caution {
+          border-color: #ef4444;
+          background-color: rgba(239, 68, 68, 0.1);
+        }
+        .markdown-alert.markdown-alert-caution .markdown-alert-title {
+          color: #ef4444;
+        }
+        .markdown-alert.markdown-alert-caution svg {
+          fill: #ef4444;
+        }
+      `}</style>
+    </div>
+  );
+}

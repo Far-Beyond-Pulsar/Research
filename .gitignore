@@ -1,0 +1,14 @@
+node_modules
+.next
+out
+.DS_Store
+
+# Supertonic ONNX models — downloaded at build time by scripts/download-models.js
+public/assets/onnx/*.onnx
+public/assets/onnx/unicode_indexer.json
+public/assets/onnx/tts.json
+public/assets/voice_styles/
+
+# onnxruntime-web WASM runtime + ESM worker files — copied from node_modules at build time
+public/ort-wasm*.wasm
+public/ort-wasm*.mjs
