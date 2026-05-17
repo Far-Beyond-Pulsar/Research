@@ -43,27 +43,31 @@ function injectDyslexicFont() {
 function extractSections() {
   const prose = document.querySelector('.doc-prose') || document.querySelector('main');
   if (!prose) return [];
+
   const clone = prose.cloneNode(true);
   clone.querySelectorAll(
     'pre, .katex, .mermaid-diagram-container, .code-block-container, script, style'
   ).forEach(el => el.remove());
 
+  // .doc-prose wraps a single .markdown-content div — walk into it
+  const root = clone.querySelector('.markdown-content') || clone;
+
   const sections = [];
   let cur = null;
 
-  for (const child of clone.children) {
+  for (const child of root.children) {
     if (/^H[1-4]$/.test(child.tagName)) {
+      // Flush previous section, start a new one at this heading
       if (cur?.text.trim()) sections.push(cur);
       cur = { label: child.textContent.trim(), text: child.textContent.trim() + '. ' };
     } else {
       if (!cur) cur = { label: 'Introduction', text: '' };
-      cur.text += (child.textContent || '').replace(/\s+/g, ' ') + ' ';
+      cur.text += (child.textContent || '').replace(/\s+/g, ' ').trim() + ' ';
     }
   }
   if (cur?.text.trim()) sections.push(cur);
 
-  // Drop trivially short sections (headings with no body)
-  return sections.filter(s => s.text.trim().length > 40);
+  return sections.filter(s => s.text.trim().length > 20);
 }
 
 // ── Worker singleton ─────────────────────────────────────────────────────────
