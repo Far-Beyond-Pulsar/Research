@@ -35,7 +35,15 @@ function dl(url, dest) {
 
     const follow = (u) => {
       get(u, (res) => {
-        if ([301,302,307,308].includes(res.statusCode)) { follow(res.headers.location); return; }
+        if ([301,302,307,308].includes(res.statusCode)) {
+          const loc = res.headers.location;
+          // Resolve relative redirects against the current request's origin
+          const next = loc.startsWith('http') ? loc : (() => {
+            const parsed = new URL(u);
+            return `${parsed.protocol}//${parsed.host}${loc}`;
+          })();
+          follow(next); return;
+        }
         if (res.statusCode !== 200) { out.destroy(); done(new Error(`HTTP ${res.statusCode}: ${u}`)); return; }
 
         const total = parseInt(res.headers['content-length'] || '0', 10);
