@@ -100,7 +100,7 @@ async function ensureEngine(onStatus) {
   try {
     onStatus('Initialising runtime…');
     const ort = await import('onnxruntime-web');
-    ort.env.wasm.wasmPaths = '/';
+    ort.env.wasm.wasmPaths = (process.env.NEXT_PUBLIC_CUSTOM_BASE_PATH || '') + '/';
 
     const basePath = process.env.NEXT_PUBLIC_CUSTOM_BASE_PATH || '';
     const useWebGPU = !webgpuKnownBroken();
@@ -147,7 +147,7 @@ async function reloadWithWasm(onStatus) {
   onStatus('WebGPU kernel failed — reloading with WASM…');
   try {
     const ort = await import('onnxruntime-web');
-    ort.env.wasm.wasmPaths = '/';
+    ort.env.wasm.wasmPaths = (process.env.NEXT_PUBLIC_CUSTOM_BASE_PATH || '') + '/';
     const basePath = process.env.NEXT_PUBLIC_CUSTOM_BASE_PATH || '';
     const result = await loadModels(['wasm'], basePath, onStatus);
     _tts = result.textToSpeech;
