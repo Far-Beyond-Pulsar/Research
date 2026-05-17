@@ -78,10 +78,14 @@ let _workerVoice  = null;  // last loaded voice name
 let _pendingMsg   = null;  // { resolve, reject }
 let _onStatusCb   = null;
 
+const mlog = (...a) => console.log('[tts-main]', ...a);
+
 function getWorker() {
   if (_worker) return _worker;
+  mlog('creating worker');
   _worker = new Worker(new URL('../workers/tts.worker.js', import.meta.url), { type: 'module' });
   _worker.onmessage = ({ data }) => {
+    mlog('← worker:', data.type, data.cmd ?? '', data.type === 'wav' ? `byteLength=${data.buffer?.byteLength}` : '');
     switch (data.type) {
       case 'status':
         _onStatusCb?.(data.msg);
@@ -91,7 +95,8 @@ function getWorker() {
         break;
       case 'done':
       case 'wav':
-        _pendingMsg?.resolve(data);
+        if (!_pendingMsg) { mlog('WARNING: got', data.type, 'but _pendingMsg is null'); break; }
+        _pendingMsg.resolve(data);
         _pendingMsg = null;
         break;
       case 'aborted':
@@ -99,12 +104,14 @@ function getWorker() {
         _pendingMsg = null;
         break;
       case 'error':
+        mlog('worker error for cmd', data.cmd, ':', data.error);
         _pendingMsg?.reject(new Error(data.error));
         _pendingMsg = null;
         break;
     }
   };
   _worker.onerror = (e) => {
+    mlog('worker onerror:', e.message);
     _pendingMsg?.reject(new Error(e.message || 'Worker error'));
     _pendingMsg = null;
   };
@@ -113,10 +120,15 @@ function getWorker() {
 
 function workerSend(msg, transfer) {
   return new Promise((resolve, reject) => {
+    if (_pendingMsg) {
+      mlog('WARNING: workerSend called while _pendingMsg already set — previous cmd may have leaked');
+    }
+    mlog('→ worker:', msg.cmd);
     _pendingMsg = { resolve, reject };
     getWorker().postMessage(msg, transfer ? [transfer] : []);
   });
 }
+
 
 function absoluteBase() {
   // Must be called from the main thread where window.location is available.
