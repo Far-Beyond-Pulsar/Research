@@ -70,113 +70,119 @@ function extractSections() {
   return sections.filter(s => s.text.trim().length > 20);
 }
 
-// ── Worker singleton ─────────────────────────────────────────────────────────
+// ── Worker pool ───────────────────────────────────────────────────────────────
 const WEBGPU_BROKEN_KEY = 'supertonic-webgpu-broken';
 function webgpuKnownBroken() { try { return localStorage.getItem(WEBGPU_BROKEN_KEY) === '1'; } catch { return false; } }
 function markWebgpuBroken()   { try { localStorage.setItem(WEBGPU_BROKEN_KEY, '1'); } catch {} }
 
-let _worker       = null;  // Worker instance
-let _workerReady  = false; // models loaded
-let _workerBusy   = false; // currently initialising
-let _workerVoice  = null;  // last loaded voice name
-let _pendingMsg   = null;  // { resolve, reject }
-let _onStatusCb   = null;
-
 const mlog = (...a) => console.log('[tts-main]', ...a);
 
-function getWorker() {
-  if (_worker) return _worker;
-  mlog('creating worker');
-  _worker = new Worker(new URL('../workers/tts.worker.js', import.meta.url), { type: 'module' });
-  _worker.onmessage = ({ data }) => {
-    mlog('← worker:', data.type, data.cmd ?? '', data.type === 'wav' ? `byteLength=${data.buffer?.byteLength}` : '');
-    switch (data.type) {
-      case 'status':
-        _onStatusCb?.(data.msg);
-        break;
-      case 'progress':
-        _onStatusCb?.(`Denoising ${data.step}/${data.total}…`);
-        break;
-      case 'done':
-      case 'wav':
-        if (!_pendingMsg) { mlog('WARNING: got', data.type, 'but _pendingMsg is null'); break; }
-        _pendingMsg.resolve(data);
-        _pendingMsg = null;
-        break;
-      case 'aborted':
-        _pendingMsg?.reject(new Error('aborted'));
-        _pendingMsg = null;
-        break;
-      case 'error':
-        mlog('worker error for cmd', data.cmd, ':', data.error);
-        _pendingMsg?.reject(new Error(data.error));
-        _pendingMsg = null;
-        break;
-    }
-  };
-  _worker.onerror = (e) => {
-    mlog('worker onerror:', e.message);
-    _pendingMsg?.reject(new Error(e.message || 'Worker error'));
-    _pendingMsg = null;
-  };
-  return _worker;
-}
-
-function workerSend(msg, transfer) {
-  return new Promise((resolve, reject) => {
-    if (_pendingMsg) {
-      mlog('WARNING: workerSend called while _pendingMsg already set — previous cmd may have leaked');
-    }
-    mlog('→ worker:', msg.cmd);
-    _pendingMsg = { resolve, reject };
-    getWorker().postMessage(msg, transfer ? [transfer] : []);
-  });
-}
-
+// Each slot: { worker, ready, busy, voice, pending, onStatus }
+const _pool = [];
 
 function absoluteBase() {
-  // Must be called from the main thread where window.location is available.
-  // Returns e.g. "https://pulsar.farbeyond.dev/Research"
   const bp = process.env.NEXT_PUBLIC_CUSTOM_BASE_PATH || '';
   return window.location.origin + bp;
 }
 
-async function ensureWorkerReady(onStatus) {
-  _onStatusCb = onStatus;
-  if (_workerReady) return true;
-  if (_workerBusy)  return false;
-  _workerBusy = true;
+function makeSlot(idx) {
+  if (_pool[idx]) return _pool[idx];
+  mlog(`creating worker[${idx}]`);
+  const slot = { worker: null, ready: false, busy: false, voice: null, pending: null, onStatus: null };
+
+  slot.worker = new Worker(new URL('../workers/tts.worker.js', import.meta.url), { type: 'module' });
+  slot.worker.onmessage = ({ data }) => {
+    mlog(`[w${idx}] ←`, data.type, data.cmd ?? '', data.type === 'wav' ? `${data.buffer?.byteLength}B` : '');
+    switch (data.type) {
+      case 'status':   slot.onStatus?.(data.msg); break;
+      case 'progress': slot.onStatus?.(`Denoising ${data.step}/${data.total}…`); break;
+      case 'done':
+      case 'wav':
+        slot.pending?.resolve(data); slot.pending = null; break;
+      case 'aborted':
+        slot.pending?.reject(new Error('aborted')); slot.pending = null; break;
+      case 'error':
+        mlog(`[w${idx}] error:`, data.error);
+        slot.pending?.reject(new Error(data.error)); slot.pending = null; break;
+    }
+  };
+  slot.worker.onerror = (e) => {
+    mlog(`[w${idx}] onerror:`, e.message);
+    slot.pending?.reject(new Error(e.message || 'Worker error')); slot.pending = null;
+  };
+
+  _pool[idx] = slot;
+  return slot;
+}
+
+function slotSend(idx, msg) {
+  const slot = makeSlot(idx);
+  return new Promise((resolve, reject) => {
+    slot.pending = { resolve, reject };
+    mlog(`[w${idx}] →`, msg.cmd);
+    slot.worker.postMessage(msg);
+  });
+}
+
+async function initSlot(idx, onStatus) {
+  const slot = makeSlot(idx);
+  if (slot.ready) return true;
+  if (slot.busy)  return false;
+  slot.busy = true;
+  slot.onStatus = onStatus;
   try {
-    const base       = absoluteBase();      // absolute URL — safe inside a blob worker
-    const wasmPath   = base + '/';
-    const skipWebGPU = webgpuKnownBroken();
-    onStatus('Initialising TTS engine…');
-    await workerSend({ cmd: 'init', wasmPath, basePath: base, skipWebGPU });
-    _workerReady = true;
-    _workerBusy  = false;
+    const base = absoluteBase();
+    onStatus(`Initialising worker ${idx + 1}…`);
+    await slotSend(idx, { cmd: 'init', wasmPath: base + '/', basePath: base, skipWebGPU: webgpuKnownBroken() });
+    slot.ready = true; slot.busy = false;
     return true;
   } catch (err) {
-    console.error('Worker init failed:', err);
-    _workerBusy = false;
-    return false;
+    mlog(`[w${idx}] init failed:`, err.message);
+    slot.busy = false; return false;
   }
 }
 
-async function workerLoadVoice(name) {
-  if (_workerVoice === name) return;
+async function ensurePoolReady(size, onStatus) {
+  const results = await Promise.all(
+    Array.from({ length: size }, (_, i) => initSlot(i, onStatus))
+  );
+  return results.every(Boolean);
+}
+
+async function loadVoiceOnSlot(idx, name) {
+  const slot = makeSlot(idx);
+  if (slot.voice === name) return;
   const base = absoluteBase();
-  await workerSend({ cmd: 'loadVoice', path: `${base}/assets/voice_styles/${name}.json` });
-  _workerVoice = name;
+  await slotSend(idx, { cmd: 'loadVoice', path: `${base}/assets/voice_styles/${name}.json` });
+  slot.voice = name;
 }
 
-function workerSynthesize(text, lang, steps, speed) {
-  return workerSend({ cmd: 'synthesize', text, lang, steps, speed });
+async function ensureVoiceOnPool(size, name) {
+  await Promise.all(Array.from({ length: size }, (_, i) => loadVoiceOnSlot(i, name)));
 }
 
-function workerAbort() {
-  _pendingMsg?.reject(new Error('aborted'));
-  _pendingMsg = null;
-  _worker?.postMessage({ cmd: 'abort' });
+function synthOnSlot(idx, text, lang, steps, speed, onStatus) {
+  const slot = makeSlot(idx);
+  slot.onStatus = onStatus;
+  return slotSend(idx, { cmd: 'synthesize', text, lang, steps, speed });
+}
+
+function abortPool() {
+  _pool.forEach((slot, i) => {
+    if (!slot) return;
+    slot.pending?.reject(new Error('aborted')); slot.pending = null;
+    slot.worker?.postMessage({ cmd: 'abort' });
+  });
+}
+
+function terminatePool() {
+  _pool.forEach((slot, i) => {
+    if (!slot) return;
+    slot.pending?.reject(new Error('aborted')); slot.pending = null;
+    slot.worker?.terminate();
+    _pool[i] = null;
+  });
+  _pool.length = 0;
 }
 
 // ── Component ────────────────────────────────────────────────────────────────
@@ -192,6 +198,7 @@ export default function AccessibilityMenu() {
   const [lang,        setLang]        = useState('en');
   const [speed,       setSpeed]       = useState(1.05);
   const [steps,       setSteps]       = useState(8);
+  const [batchSize,   setBatchSize]   = useState(2);
   const [debugWavs,   setDebugWavs]   = useState([]); // [{ label, url }]
 
   const audioCtxRef = useRef(null);
@@ -219,7 +226,7 @@ export default function AccessibilityMenu() {
   // ── TTS ─────────────────────────────────────────────────────────────────
   const stopAudio = useCallback(() => {
     abortRef.current = true;
-    workerAbort();
+    abortPool();
     try { sourceRef.current?.stop(); } catch {}
     try { audioCtxRef.current?.close(); } catch {}
     sourceRef.current = null;
@@ -243,12 +250,12 @@ export default function AccessibilityMenu() {
     setTtsStatus('loading');
     setTtsMsg('');
 
-    const ok = await ensureWorkerReady((msg) => setTtsMsg(msg));
+    const ok = await ensurePoolReady(batchSize, (msg) => setTtsMsg(msg));
     if (!ok) { setTtsStatus('unavailable'); setTtsMsg('TTS engine failed to load'); return; }
 
     try {
-      setTtsMsg(`Loading voice ${voice}…`);
-      await workerLoadVoice(voice);
+      setTtsMsg(`Loading voice ${voice} on ${batchSize} worker${batchSize > 1 ? 's' : ''}…`);
+      await ensureVoiceOnPool(batchSize, voice);
     } catch {
       setTtsStatus('unavailable'); setTtsMsg('Voice failed to load'); return;
     }
@@ -256,84 +263,108 @@ export default function AccessibilityMenu() {
     const sections = extractSections();
     if (!sections.length) { setTtsStatus('ready'); return; }
 
+    mlog('sections:', sections.map(s => `"${s.label}" (${s.text.length}ch)`));
+
     setTtsStatus('reading');
     setDebugWavs([]);
 
+    // Helper: synthesise one section on a specific worker slot, with WebGPU→WASM fallback
+    const synth = async (sec, slotIdx) => {
+      mlog(`synth start [w${slotIdx}]:`, sec.label);
+      const onStatus = (msg) => setTtsMsg(`[w${slotIdx}] ${msg}`);
+      try {
+        return await synthOnSlot(slotIdx, sec.text, lang, steps, speed, onStatus);
+      } catch (err) {
+        if (err.message === 'aborted') throw err;
+        if (!webgpuKnownBroken()) {
+          markWebgpuBroken();
+          setTtsMsg('WebGPU failed — restarting pool with WASM…');
+          terminatePool();
+          const ok2 = await ensurePoolReady(batchSize, (m) => setTtsMsg(m));
+          if (!ok2) throw err;
+          await ensureVoiceOnPool(batchSize, voice);
+          return await synthOnSlot(slotIdx, sec.text, lang, steps, speed, onStatus);
+        }
+        throw err;
+      }
+    };
+
+    const playWav = async (wav, sec, i) => {
+      mlog('wav received:', sec.label, 'byteLength:', wav?.buffer?.byteLength);
+
+      try {
+        const blob = new Blob([wav.buffer], { type: 'audio/wav' });
+        const url  = URL.createObjectURL(blob);
+        mlog('debug blob size:', blob.size);
+        setDebugWavs(prev => [...prev, { label: sec.label, url }]);
+      } catch (e) { mlog('blob failed:', e.message); }
+
+      let decoded;
+      try {
+        decoded = await ctx.decodeAudioData(wav.buffer.slice(0));
+        mlog('decoded duration:', decoded.duration);
+      } catch (e) {
+        mlog('decodeAudioData failed:', e.message);
+        setTtsMsg(`Decode error for "${sec.label}": ${e.message}`);
+        return;
+      }
+
+      setTtsMsg(`▶  "${sec.label}" (${i + 1}/${sections.length})`);
+      await ctx.resume();
+      await new Promise((resolve) => {
+        const src = ctx.createBufferSource();
+        src.buffer = decoded;
+        src.connect(ctx.destination);
+        sourceRef.current = src;
+        src.onended = () => { mlog('ended:', sec.label); resolve(); };
+        mlog('playing:', sec.label);
+        src.start(0);
+      });
+      sourceRef.current = null;
+    };
+
     try {
+      // ── Pipeline: batchSize workers synthesise ahead while audio plays ────
+      // pending[i] holds the synthesis promise for section i
+      const pending = new Array(sections.length);
+
+      // Pre-fill the first batchSize slots
+      for (let j = 0; j < Math.min(batchSize, sections.length); j++) {
+        mlog(`pipeline pre-fill [w${j}]:`, sections[j].label);
+        pending[j] = synth(sections[j], j);
+      }
+
       for (let i = 0; i < sections.length; i++) {
         if (abortRef.current) break;
-        const sec = sections[i];
 
-        // Synthesise in the worker (off the main thread — tab stays responsive)
-        _onStatusCb = (msg) => setTtsMsg(msg);
-        setTtsMsg(`Synthesising "${sec.label}" (${i + 1}/${sections.length})…`);
-
+        // Wait for section i's WAV (synthesised on worker i % batchSize)
         let wav;
         try {
-          wav = await workerSynthesize(sec.text, lang, steps, speed);
+          wav = await pending[i];
         } catch (err) {
+          mlog('synth error for', sections[i].label, ':', err.message);
           if (err.message === 'aborted' || abortRef.current) break;
-          if (!webgpuKnownBroken()) {
-            markWebgpuBroken();
-            _workerReady = false; _workerVoice = null;
-            _worker?.terminate(); _worker = null;
-            _workerBusy = false;
-            setTtsMsg('WebGPU failed — restarting with WASM…');
-            const ok2 = await ensureWorkerReady((m) => setTtsMsg(m));
-            if (!ok2 || abortRef.current) break;
-            await workerLoadVoice(voice);
-            try { _onStatusCb = (msg) => setTtsMsg(msg); wav = await workerSynthesize(sec.text, lang, steps, speed); }
-            catch (e) { setTtsMsg(`Skipping "${sec.label}": ${e.message}`); continue; }
-          } else {
-            setTtsMsg(`Skipping "${sec.label}": ${err.message}`);
-            continue;
+          setTtsMsg(`Skipping "${sections[i].label}": ${err.message}`);
+          // Keep pipeline moving: kick off i+batchSize on the freed slot
+          const next = i + batchSize;
+          if (next < sections.length) {
+            mlog(`pipeline recover [w${i % batchSize}] →`, sections[next].label);
+            pending[next] = synth(sections[next], i % batchSize);
           }
-        }
-
-        if (abortRef.current) break;
-
-        mlog('wav received for', sec.label, 'buffer:', wav?.buffer?.byteLength, 'sampleRate:', wav?.sampleRate);
-
-        // Add to debug list as a playable blob
-        try {
-          const blob = new Blob([wav.buffer], { type: 'audio/wav' });
-          const url  = URL.createObjectURL(blob);
-          mlog('blob created, size:', blob.size, 'url:', url);
-          setDebugWavs(prev => [...prev, { label: sec.label, url }]);
-        } catch (e) {
-          mlog('blob creation failed:', e.message);
-        }
-
-        // Decode WAV → AudioBuffer
-        let decoded;
-        try {
-          mlog('decoding audio data, byteLength:', wav.buffer.byteLength);
-          decoded = await ctx.decodeAudioData(wav.buffer.slice(0));
-          mlog('decoded OK, duration:', decoded.duration, 'channels:', decoded.numberOfChannels);
-        } catch (e) {
-          console.error('decodeAudioData failed:', e);
-          setTtsMsg(`Audio decode error for "${sec.label}": ${e.message}`);
           continue;
         }
 
         if (abortRef.current) break;
 
-        // Play and wait for it to finish before moving to the next section
-        setTtsMsg(`▶  "${sec.label}" (${i + 1}/${sections.length})`);
-        mlog('ctx state before resume:', ctx.state);
-        await ctx.resume();
-        mlog('ctx state after resume:', ctx.state);
-        await new Promise((resolve) => {
-          const src = ctx.createBufferSource();
-          src.buffer = decoded;
-          src.connect(ctx.destination);
-          sourceRef.current = src;
-          src.onended = () => { mlog('playback ended for', sec.label); resolve(); };
-          mlog('starting playback for', sec.label);
-          src.start(0);
-        });
-        sourceRef.current = null;
-        mlog('playback done for', sec.label);
+        // WAV ready — immediately start synthesising section i+batchSize on the freed slot
+        const next = i + batchSize;
+        if (next < sections.length) {
+          mlog(`pipeline ahead [w${i % batchSize}]:`, sections[next].label, `(playing ${sections[i].label})`);
+          pending[next] = synth(sections[next], i % batchSize);
+        }
+
+        // Play section i — the freed slot is already working on next
+        await playWav(wav, sections[i], i);
       }
     } catch (err) {
       console.error('TTS pipeline error:', err);
@@ -491,6 +522,21 @@ export default function AccessibilityMenu() {
                 disabled={isLoading || isReading || isPaused}
               />
               <span className="a11y-value">{steps}</span>
+            </div>
+          </div>
+
+          <div className="a11y-row">
+            <label htmlFor="a11y-batch">Workers</label>
+            <div className="a11y-speed-wrap">
+              <input
+                id="a11y-batch"
+                type="range" min={1} max={4} step={1}
+                value={batchSize}
+                onChange={e => setBatchSize(Number(e.target.value))}
+                className="a11y-slider"
+                disabled={isLoading || isReading || isPaused}
+              />
+              <span className="a11y-value">{batchSize}×</span>
             </div>
           </div>
 
