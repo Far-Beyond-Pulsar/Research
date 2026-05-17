@@ -176,6 +176,7 @@ export default function AccessibilityMenu() {
   const [lang,        setLang]        = useState('en');
   const [speed,       setSpeed]       = useState(1.05);
   const [steps,       setSteps]       = useState(8);
+  const [debugWavs,   setDebugWavs]   = useState([]); // [{ label, url }]
 
   const audioCtxRef = useRef(null);
   const sourceRef   = useRef(null);
@@ -213,6 +214,16 @@ export default function AccessibilityMenu() {
 
   const startReading = useCallback(async () => {
     abortRef.current = false;
+
+    // ↓ Create + resume AudioContext SYNCHRONOUSLY while the click gesture is still live.
+    //   Chrome suspends any AudioContext created after an await boundary.
+    let ctx = audioCtxRef.current;
+    if (!ctx || ctx.state === 'closed') {
+      ctx = new AudioContext();
+      audioCtxRef.current = ctx;
+    }
+    ctx.resume().catch(() => {});   // no-op if already running; non-blocking
+
     setTtsStatus('loading');
     setTtsMsg('');
 
@@ -230,24 +241,22 @@ export default function AccessibilityMenu() {
     if (!sections.length) { setTtsStatus('ready'); return; }
 
     setTtsStatus('reading');
-    const ctx = new AudioContext();
-    audioCtxRef.current = ctx;
+    setDebugWavs([]);
 
     try {
       for (let i = 0; i < sections.length; i++) {
         if (abortRef.current) break;
         const sec = sections[i];
 
-        // Synthesise in the worker (off the main thread — no freeze)
+        // Synthesise in the worker (off the main thread — tab stays responsive)
+        _onStatusCb = (msg) => setTtsMsg(msg);
         setTtsMsg(`Synthesising "${sec.label}" (${i + 1}/${sections.length})…`);
+
         let wav;
         try {
-          _onStatusCb = (msg) => setTtsMsg(msg);
-          const res = await workerSynthesize(sec.text, lang, steps, speed);
-          wav = res; // { buffer, sampleRate }
+          wav = await workerSynthesize(sec.text, lang, steps, speed);
         } catch (err) {
           if (err.message === 'aborted' || abortRef.current) break;
-          // WebGPU inference failure — mark broken, restart worker with WASM
           if (!webgpuKnownBroken()) {
             markWebgpuBroken();
             _workerReady = false; _workerVoice = null;
@@ -257,10 +266,8 @@ export default function AccessibilityMenu() {
             const ok2 = await ensureWorkerReady((m) => setTtsMsg(m));
             if (!ok2 || abortRef.current) break;
             await workerLoadVoice(voice);
-            try {
-              _onStatusCb = (msg) => setTtsMsg(msg);
-              wav = await workerSynthesize(sec.text, lang, steps, speed);
-            } catch { continue; }
+            try { _onStatusCb = (msg) => setTtsMsg(msg); wav = await workerSynthesize(sec.text, lang, steps, speed); }
+            catch (e) { setTtsMsg(`Skipping "${sec.label}": ${e.message}`); continue; }
           } else {
             setTtsMsg(`Skipping "${sec.label}": ${err.message}`);
             continue;
@@ -269,18 +276,34 @@ export default function AccessibilityMenu() {
 
         if (abortRef.current) break;
 
-        // Decode and play (main thread — non-blocking hardware audio)
-        setTtsMsg(`▶  "${sec.label}" (${i + 1}/${sections.length})`);
-        const decoded = await ctx.decodeAudioData(wav.buffer);
+        // Add to debug list as a playable blob
+        const blob = new Blob([wav.buffer], { type: 'audio/wav' });
+        const url  = URL.createObjectURL(blob);
+        setDebugWavs(prev => [...prev, { label: sec.label, url }]);
+
+        // Decode WAV → AudioBuffer
+        let decoded;
+        try {
+          // slice() so decodeAudioData doesn't detach the original transferred buffer
+          decoded = await ctx.decodeAudioData(wav.buffer.slice(0));
+        } catch (e) {
+          console.error('decodeAudioData failed:', e);
+          setTtsMsg(`Audio decode error for "${sec.label}"`);
+          continue;
+        }
+
         if (abortRef.current) break;
 
+        // Play and wait for it to finish before moving to the next section
+        setTtsMsg(`▶  "${sec.label}" (${i + 1}/${sections.length})`);
+        await ctx.resume(); // ensure context is running after long synthesis wait
         await new Promise((resolve) => {
           const src = ctx.createBufferSource();
           src.buffer = decoded;
           src.connect(ctx.destination);
           sourceRef.current = src;
           src.onended = resolve;
-          src.start();
+          src.start(0);
         });
         sourceRef.current = null;
       }
@@ -470,6 +493,21 @@ export default function AccessibilityMenu() {
               <p className="a11y-unavail">TTS unavailable — run <code>npm run download-models</code></p>
             )}
           </div>
+
+          {debugWavs.length > 0 && (
+            <div className="a11y-debug">
+              <p className="a11y-debug-title">
+                Debug WAVs
+                <button className="a11y-debug-clear" onClick={() => setDebugWavs([])}>clear</button>
+              </p>
+              {debugWavs.map(({ label, url }, i) => (
+                <div key={i} className="a11y-debug-item">
+                  <span className="a11y-debug-label" title={label}>{label}</span>
+                  <audio src={url} controls preload="none" className="a11y-debug-audio" />
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
     </div>
