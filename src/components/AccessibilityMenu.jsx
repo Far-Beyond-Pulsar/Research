@@ -118,18 +118,24 @@ function workerSend(msg, transfer) {
   });
 }
 
+function absoluteBase() {
+  // Must be called from the main thread where window.location is available.
+  // Returns e.g. "https://pulsar.farbeyond.dev/Research"
+  const bp = process.env.NEXT_PUBLIC_CUSTOM_BASE_PATH || '';
+  return window.location.origin + bp;
+}
+
 async function ensureWorkerReady(onStatus) {
   _onStatusCb = onStatus;
   if (_workerReady) return true;
   if (_workerBusy)  return false;
   _workerBusy = true;
   try {
-    const basePath  = process.env.NEXT_PUBLIC_CUSTOM_BASE_PATH || '';
-    const wasmPath  = basePath + '/';
+    const base       = absoluteBase();      // absolute URL — safe inside a blob worker
+    const wasmPath   = base + '/';
     const skipWebGPU = webgpuKnownBroken();
     onStatus('Initialising TTS engine…');
-    const res = await workerSend({ cmd: 'init', wasmPath, basePath, skipWebGPU });
-    if (res.backend === 'webgpu') { /* good */ }
+    await workerSend({ cmd: 'init', wasmPath, basePath: base, skipWebGPU });
     _workerReady = true;
     _workerBusy  = false;
     return true;
@@ -142,8 +148,8 @@ async function ensureWorkerReady(onStatus) {
 
 async function workerLoadVoice(name) {
   if (_workerVoice === name) return;
-  const basePath = process.env.NEXT_PUBLIC_CUSTOM_BASE_PATH || '';
-  await workerSend({ cmd: 'loadVoice', path: `${basePath}/assets/voice_styles/${name}.json` });
+  const base = absoluteBase();
+  await workerSend({ cmd: 'loadVoice', path: `${base}/assets/voice_styles/${name}.json` });
   _workerVoice = name;
 }
 
@@ -246,6 +252,7 @@ export default function AccessibilityMenu() {
             markWebgpuBroken();
             _workerReady = false; _workerVoice = null;
             _worker?.terminate(); _worker = null;
+            _workerBusy = false;
             setTtsMsg('WebGPU failed — restarting with WASM…');
             const ok2 = await ensureWorkerReady((m) => setTtsMsg(m));
             if (!ok2 || abortRef.current) break;
