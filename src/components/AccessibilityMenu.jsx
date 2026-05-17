@@ -66,110 +66,95 @@ function extractSections() {
   return sections.filter(s => s.text.trim().length > 40);
 }
 
-// ── Supertonic TTS engine (module-level singleton) ───────────────────────────
-let _tts         = null;   // TextToSpeech instance
-let _style       = null;   // current Style tensor
-let _loading     = false;
-let _unavailable = false;
-let _backend     = null;   // 'webgpu' | 'wasm'
-
+// ── Worker singleton ─────────────────────────────────────────────────────────
 const WEBGPU_BROKEN_KEY = 'supertonic-webgpu-broken';
+function webgpuKnownBroken() { try { return localStorage.getItem(WEBGPU_BROKEN_KEY) === '1'; } catch { return false; } }
+function markWebgpuBroken()   { try { localStorage.setItem(WEBGPU_BROKEN_KEY, '1'); } catch {} }
 
-function webgpuKnownBroken() {
-  try { return localStorage.getItem(WEBGPU_BROKEN_KEY) === '1'; } catch { return false; }
-}
-function markWebgpuBroken() {
-  try { localStorage.setItem(WEBGPU_BROKEN_KEY, '1'); } catch {}
-}
+let _worker       = null;  // Worker instance
+let _workerReady  = false; // models loaded
+let _workerBusy   = false; // currently initialising
+let _workerVoice  = null;  // last loaded voice name
+let _pendingMsg   = null;  // { resolve, reject }
+let _onStatusCb   = null;
 
-async function loadModels(executionProviders, basePath, onStatus) {
-  const { loadTextToSpeech } = await import('@/lib/supertonic.js');
-  return loadTextToSpeech(
-    `${basePath}/assets/onnx`,
-    { executionProviders, graphOptimizationLevel: 'all' },
-    (name, cur, tot) => onStatus(`Loading ${name} (${cur}/${tot})…`)
-  );
-}
-
-async function ensureEngine(onStatus) {
-  if (_tts && _style) return true;
-  if (_unavailable)   return false;
-  if (_loading)       return false;
-  _loading = true;
-
-  try {
-    onStatus('Initialising runtime…');
-    const ort = await import('onnxruntime-web');
-    ort.env.wasm.wasmPaths = (process.env.NEXT_PUBLIC_CUSTOM_BASE_PATH || '') + '/';
-
-    const basePath = process.env.NEXT_PUBLIC_CUSTOM_BASE_PATH || '';
-    const useWebGPU = !webgpuKnownBroken();
-
-    let result;
-    if (useWebGPU) {
-      try {
-        result = await loadModels(['webgpu'], basePath, onStatus);
-        _backend = 'webgpu';
-      } catch {
-        // WebGPU failed at load time — mark broken and fall through to WASM
-        markWebgpuBroken();
-        onStatus('WebGPU unavailable, loading WASM…');
-        result = await loadModels(['wasm'], basePath, onStatus);
-        _backend = 'wasm';
-      }
-    } else {
-      result = await loadModels(['wasm'], basePath, onStatus);
-      _backend = 'wasm';
+function getWorker() {
+  if (_worker) return _worker;
+  _worker = new Worker(new URL('../workers/tts.worker.js', import.meta.url), { type: 'module' });
+  _worker.onmessage = ({ data }) => {
+    switch (data.type) {
+      case 'status':
+        _onStatusCb?.(data.msg);
+        break;
+      case 'progress':
+        _onStatusCb?.(`Denoising ${data.step}/${data.total}…`);
+        break;
+      case 'done':
+      case 'wav':
+        _pendingMsg?.resolve(data);
+        _pendingMsg = null;
+        break;
+      case 'aborted':
+        _pendingMsg?.reject(new Error('aborted'));
+        _pendingMsg = null;
+        break;
+      case 'error':
+        _pendingMsg?.reject(new Error(data.error));
+        _pendingMsg = null;
+        break;
     }
+  };
+  _worker.onerror = (e) => {
+    _pendingMsg?.reject(new Error(e.message || 'Worker error'));
+    _pendingMsg = null;
+  };
+  return _worker;
+}
 
-    _tts = result.textToSpeech;
+function workerSend(msg, transfer) {
+  return new Promise((resolve, reject) => {
+    _pendingMsg = { resolve, reject };
+    getWorker().postMessage(msg, transfer ? [transfer] : []);
+  });
+}
 
-    onStatus('Loading voice style…');
-    const { loadVoiceStyle } = await import('@/lib/supertonic.js');
-    _style = await loadVoiceStyle([`${basePath}/assets/voice_styles/M1.json`], false);
-
-    _loading = false;
+async function ensureWorkerReady(onStatus) {
+  _onStatusCb = onStatus;
+  if (_workerReady) return true;
+  if (_workerBusy)  return false;
+  _workerBusy = true;
+  try {
+    const basePath  = process.env.NEXT_PUBLIC_CUSTOM_BASE_PATH || '';
+    const wasmPath  = basePath + '/';
+    const skipWebGPU = webgpuKnownBroken();
+    onStatus('Initialising TTS engine…');
+    const res = await workerSend({ cmd: 'init', wasmPath, basePath, skipWebGPU });
+    if (res.backend === 'webgpu') { /* good */ }
+    _workerReady = true;
+    _workerBusy  = false;
     return true;
   } catch (err) {
-    console.error('Supertonic load failed:', err);
-    _unavailable = true;
-    _loading = false;
+    console.error('Worker init failed:', err);
+    _workerBusy = false;
     return false;
   }
 }
 
-// Called when WebGPU succeeds at load time but fails during inference.
-// Marks it broken so next session skips it, then reloads with WASM.
-async function reloadWithWasm(onStatus) {
-  if (_backend === 'wasm') return false;
-  markWebgpuBroken();
-  _tts = null; _style = null; _backend = null;
-  onStatus('WebGPU kernel failed — reloading with WASM…');
-  try {
-    const ort = await import('onnxruntime-web');
-    ort.env.wasm.wasmPaths = (process.env.NEXT_PUBLIC_CUSTOM_BASE_PATH || '') + '/';
-    const basePath = process.env.NEXT_PUBLIC_CUSTOM_BASE_PATH || '';
-    const result = await loadModels(['wasm'], basePath, onStatus);
-    _tts = result.textToSpeech;
-    const { loadVoiceStyle } = await import('@/lib/supertonic.js');
-    _style = await loadVoiceStyle([`${basePath}/assets/voice_styles/M1.json`], false);
-    _backend = 'wasm';
-    return true;
-  } catch {
-    _unavailable = true;
-    return false;
-  }
+async function workerLoadVoice(name) {
+  if (_workerVoice === name) return;
+  const basePath = process.env.NEXT_PUBLIC_CUSTOM_BASE_PATH || '';
+  await workerSend({ cmd: 'loadVoice', path: `${basePath}/assets/voice_styles/${name}.json` });
+  _workerVoice = name;
 }
 
-async function loadVoiceByName(name) {
-  if (!_tts) return;
-  try {
-    const { loadVoiceStyle } = await import('@/lib/supertonic.js');
-    const basePath = process.env.NEXT_PUBLIC_CUSTOM_BASE_PATH || '';
-    _style = await loadVoiceStyle([`${basePath}/assets/voice_styles/${name}.json`], false);
-  } catch (err) {
-    console.error('Voice load failed:', err);
-  }
+function workerSynthesize(text, lang, steps, speed) {
+  return workerSend({ cmd: 'synthesize', text, lang, steps, speed });
+}
+
+function workerAbort() {
+  _pendingMsg?.reject(new Error('aborted'));
+  _pendingMsg = null;
+  _worker?.postMessage({ cmd: 'abort' });
 }
 
 // ── Component ────────────────────────────────────────────────────────────────
@@ -211,11 +196,13 @@ export default function AccessibilityMenu() {
   // ── TTS ─────────────────────────────────────────────────────────────────
   const stopAudio = useCallback(() => {
     abortRef.current = true;
+    workerAbort();
     try { sourceRef.current?.stop(); } catch {}
     try { audioCtxRef.current?.close(); } catch {}
     sourceRef.current = null;
     audioCtxRef.current = null;
     setTtsStatus(s => s === 'unavailable' ? s : 'ready');
+    setTtsMsg('');
   }, []);
 
   const startReading = useCallback(async () => {
@@ -223,102 +210,78 @@ export default function AccessibilityMenu() {
     setTtsStatus('loading');
     setTtsMsg('');
 
-    const ok = await ensureEngine((msg) => setTtsMsg(msg));
-    if (!ok) { setTtsStatus('unavailable'); setTtsMsg('TTS models unavailable'); return; }
+    const ok = await ensureWorkerReady((msg) => setTtsMsg(msg));
+    if (!ok) { setTtsStatus('unavailable'); setTtsMsg('TTS engine failed to load'); return; }
 
-    await loadVoiceByName(voice);
+    try {
+      setTtsMsg(`Loading voice ${voice}…`);
+      await workerLoadVoice(voice);
+    } catch {
+      setTtsStatus('unavailable'); setTtsMsg('Voice failed to load'); return;
+    }
 
     const sections = extractSections();
     if (!sections.length) { setTtsStatus('ready'); return; }
 
     setTtsStatus('reading');
-    const { writeWavFile } = await import('@/lib/supertonic.js');
-
-    // Synthesise one section, with WebGPU→WASM fallback on first failure
-    let gpuFallbackDone = false;
-    const bake = async (text, label, idx, total) => {
-      const run = () => _tts.call(text, lang, _style, steps, speed, 0.3);
-      try {
-        return await run();
-      } catch (err) {
-        if (_backend === 'webgpu' && !gpuFallbackDone) {
-          gpuFallbackDone = true;
-          console.warn('WebGPU inference failed, falling back to WASM');
-          const ok2 = await reloadWithWasm((msg) => setTtsMsg(msg));
-          if (!ok2) throw err;
-          return await run();
-        }
-        throw err;
-      }
-    };
-
-    const toAudioBuffer = async (ctx, result) => {
-      const { wav, duration } = result;
-      const buf = writeWavFile(
-        wav.slice(0, Math.floor(_tts.sampleRate * duration[0])),
-        _tts.sampleRate
-      );
-      // slice() copies the buffer so decodeAudioData doesn't consume the original
-      return ctx.decodeAudioData(buf.slice(0));
-    };
-
     const ctx = new AudioContext();
     audioCtxRef.current = ctx;
 
     try {
-      // Kick off synthesis of section 0 immediately
-      let pendingSynth = bake(sections[0].text, sections[0].label, 0, sections.length);
-
       for (let i = 0; i < sections.length; i++) {
         if (abortRef.current) break;
         const sec = sections[i];
 
-        // Update progress label
-        setTtsMsg(`Baking "${sec.label}" (${i + 1}/${sections.length})…`);
-
-        // Wait for section i's audio to be synthesised
-        let synthResult;
+        // Synthesise in the worker (off the main thread — no freeze)
+        setTtsMsg(`Synthesising "${sec.label}" (${i + 1}/${sections.length})…`);
+        let wav;
         try {
-          synthResult = await pendingSynth;
+          _onStatusCb = (msg) => setTtsMsg(msg);
+          const res = await workerSynthesize(sec.text, lang, steps, speed);
+          wav = res; // { buffer, sampleRate }
         } catch (err) {
-          console.error(`Synthesis failed for section "${sec.label}":`, err);
-          setTtsMsg(`Skipping "${sec.label}" — ${err.message}`);
-          if (i + 1 < sections.length)
-            pendingSynth = bake(sections[i + 1].text, sections[i + 1].label, i + 1, sections.length);
-          continue;
+          if (err.message === 'aborted' || abortRef.current) break;
+          // WebGPU inference failure — mark broken, restart worker with WASM
+          if (!webgpuKnownBroken()) {
+            markWebgpuBroken();
+            _workerReady = false; _workerVoice = null;
+            _worker?.terminate(); _worker = null;
+            setTtsMsg('WebGPU failed — restarting with WASM…');
+            const ok2 = await ensureWorkerReady((m) => setTtsMsg(m));
+            if (!ok2 || abortRef.current) break;
+            await workerLoadVoice(voice);
+            try {
+              _onStatusCb = (msg) => setTtsMsg(msg);
+              wav = await workerSynthesize(sec.text, lang, steps, speed);
+            } catch { continue; }
+          } else {
+            setTtsMsg(`Skipping "${sec.label}": ${err.message}`);
+            continue;
+          }
         }
 
         if (abortRef.current) break;
 
-        // Immediately kick off synthesis of section i+1 (runs concurrently with playback below)
-        if (i + 1 < sections.length) {
-          pendingSynth = bake(sections[i + 1].text, sections[i + 1].label, i + 1, sections.length);
-        }
-
-        // Decode and play section i
-        const audioBuffer = await toAudioBuffer(ctx, synthResult);
+        // Decode and play (main thread — non-blocking hardware audio)
+        setTtsMsg(`▶  "${sec.label}" (${i + 1}/${sections.length})`);
+        const decoded = await ctx.decodeAudioData(wav.buffer);
         if (abortRef.current) break;
 
         await new Promise((resolve) => {
           const src = ctx.createBufferSource();
-          src.buffer = audioBuffer;
+          src.buffer = decoded;
           src.connect(ctx.destination);
           sourceRef.current = src;
-          setTtsMsg(`▶ "${sec.label}" — baking ${i + 2 < sections.length ? `"${sections[i + 1].label}"` : 'done'}…`);
           src.onended = resolve;
           src.start();
         });
-
         sourceRef.current = null;
       }
     } catch (err) {
       console.error('TTS pipeline error:', err);
       setTtsMsg(`Error: ${err.message}`);
     } finally {
-      if (!abortRef.current) {
-        setTtsStatus('ready');
-        setTtsMsg('');
-      }
+      if (!abortRef.current) { setTtsStatus('ready'); setTtsMsg(''); }
     }
   }, [voice, lang, speed, steps]);
 

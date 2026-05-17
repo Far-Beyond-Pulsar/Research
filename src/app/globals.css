@@ -349,17 +349,19 @@ a {
 
 .toc-resize-handle {
   position: absolute;
-  left: 0;
+  left: -3px;   /* straddle the border-left of .toc-list */
   top: 0;
   bottom: 0;
-  width: 4px;
+  width: 7px;   /* 3px left of border + 1px border + 3px right = easy grab */
   cursor: col-resize;
   background: transparent;
   transition: background 0.15s;
+  z-index: 1;
 }
 
-.toc-resize-handle:hover {
-  background: var(--accent);
+.toc-resize-handle:hover,
+.toc-resize-handle:active {
+  background: rgba(56, 139, 253, 0.25);
 }
 
 .toc-label {
