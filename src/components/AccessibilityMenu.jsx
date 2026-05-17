@@ -316,16 +316,20 @@ export default function AccessibilityMenu() {
 
         // Play and wait for it to finish before moving to the next section
         setTtsMsg(`▶  "${sec.label}" (${i + 1}/${sections.length})`);
-        await ctx.resume(); // ensure context is running after long synthesis wait
+        mlog('ctx state before resume:', ctx.state);
+        await ctx.resume();
+        mlog('ctx state after resume:', ctx.state);
         await new Promise((resolve) => {
           const src = ctx.createBufferSource();
           src.buffer = decoded;
           src.connect(ctx.destination);
           sourceRef.current = src;
-          src.onended = resolve;
+          src.onended = () => { mlog('playback ended for', sec.label); resolve(); };
+          mlog('starting playback for', sec.label);
           src.start(0);
         });
         sourceRef.current = null;
+        mlog('playback done for', sec.label);
       }
     } catch (err) {
       console.error('TTS pipeline error:', err);
