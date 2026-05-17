@@ -96,10 +96,12 @@ async function main() {
     }
 
     console.log('\n✅ All Supertonic assets ready\n');
+    process.exit(0);
   } catch (err) {
     console.error(`\n⚠️  Model download failed: ${err.message}`);
     console.error('   TTS will be disabled.\n');
     writeFileSync(FLAG, err.message);
+    process.exit(0); // non-fatal — build continues, TTS disabled in UI
   }
 }
 
