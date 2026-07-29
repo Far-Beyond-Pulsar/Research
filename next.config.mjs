@@ -3,6 +3,9 @@
 const basePath = process.env.BASE_PATH ?? '/Research';
 
 const nextConfig = {
+  env: {
+    NEXT_PUBLIC_CUSTOM_BASE_PATH: basePath,
+  },
   output: 'export',
   trailingSlash: true,
   images: {

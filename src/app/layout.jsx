@@ -1,7 +1,13 @@
 import './globals.css';
 import { JetBrains_Mono, Inter } from 'next/font/google';
 import Link from 'next/link';
-import AccessibilityMenu from '@/components/AccessibilityMenu';
+import dynamic from 'next/dynamic';
+
+// AccessibilityMenu (TTS) is disabled in dev to avoid Turbopack processing onnxruntime-web
+const AccessibilityMenu =
+  process.env.NODE_ENV === 'production'
+    ? dynamic(() => import('@/components/AccessibilityMenu'))
+    : () => null;
 
 const uiFont = JetBrains_Mono({
   subsets: ['latin'],
